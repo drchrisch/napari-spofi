@@ -1,0 +1,39 @@
+{
+	"default_annotation_dir": "None",
+	"default_model_dir": "None",
+	"default_img_dir": "None",
+	"img_shape" : [64, 1024, 1024],
+	"tile_shape": [64, 64, 64],
+	"step_size": [64, 64, 64],
+	"_normalization_type_comment": "'full' and 'full_nozero' are allowed values",
+	"normalization_type": "full",
+	"normalization_range": {
+		"min": 1.0,
+		"max": 99.8
+	},
+	"_voxel_size_comment": "voxel size (xyz)",
+	"voxel_size": [0.17, 0.17, 0.75],
+	"_spot_radius_comment": "spot_radius defines to which extent (px!) annotation points are expanded, should match actual spot size",
+	"spot_radius": {
+		"z": 3,
+		"y": 3,
+		"x": 3
+	},
+	"_spot_display_radius_comment": "spot_display_radius defines the size of spots in viewer presentation",
+	"spot_display_radius" : [2, 2, 2],
+	"display_blur_sigmas": [0.5],
+	"viewer_colors": ["green", "red"],
+	"edge_colors": ["lime", "lime", "lime"],
+	"face_colors": ["magenta", "cyan", "yellow"],
+	"tile_color": [5, 255],
+	"sd_data_dir": "SD_data",
+	"_default_fg_channel": "preferable 'ch1_processed",
+	"default_fg_channel": "ch1_processed_reg",
+	"_default_bg_channel": "preferable 'ch2_processed",
+	"default_bg_channel": "ch2_processed_reg",
+	"validation_fraction": 0.2,
+	"steps_per_epoch": 5,
+	"number_of_epochs": 100,
+	"n_rays": 96,
+	"train_patch_size": [64, 64, 64]
+}
