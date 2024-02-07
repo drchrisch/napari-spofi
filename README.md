@@ -17,6 +17,7 @@ This [napari] plugin was generated with [Cookiecutter] using [@napari]'s [cookie
 Don't miss the full getting started guide to set up your new package:
 https://github.com/napari/cookiecutter-napari-plugin#getting-started
 
+
 and review the napari docs for plugin developers:
 https://napari.org/stable/plugins/index.html
 -->
