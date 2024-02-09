@@ -68,9 +68,9 @@ check, 100 epochs is a good start. The plugin uses a simplified setup for StarDi
 configurations (please see [StarDist](https://github.com/stardist/stardist/) for a full discussion).
 
 Start training and watch the 'loss' and 'val_loss' values, which should decrease
-steadily while their ratio should remain at 1 as training progresses.
+steadily while their ratio should roughly remain at 1 as training progresses.
 
-The retrain option allows the selection of a model for retraining.
+The retrain option allows the selection of an existing model for retraining.
 
 ### Predict instances
 Go to the 'prediction' section of the widget to start spot prediction for the
