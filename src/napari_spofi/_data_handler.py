@@ -843,7 +843,7 @@ class DataHandler:
         )
 
         # save for imagej (optional)
-        # """
+        """
         # swap axes to reach TZCYX format
         img_tile = np.swapaxes(img_tile, 3, 1)
         img_tile = np.swapaxes(img_tile, 2, 3)
@@ -857,7 +857,7 @@ class DataHandler:
             resolution=(1.0, 1.0),
             metadata={"axes": "ZCYX", "spacing": 1.0, "unit": "pixel"},
         )
-        # """
+        """
 
     @staticmethod
     def _write_mask_tile(mask_tile, path, file):
