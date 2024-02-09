@@ -26,7 +26,7 @@ https://napari.org/stable/plugins/index.html
 
 This plugin provides tools for annotating spots in a 3D two-channel image (hdf5 type input file),
 submitting tiles for StarDist model generation or model re-training, and refining initial annotations
-based on predictions (human-in-the-loop approach).
+based on predictions (kind of human-in-the-loop approach).
 
 The objects of interest in the image are sphere-like spots with a diameter of just a
 few pixels and are thus well suited for StarDist instance segmentation. The image 
