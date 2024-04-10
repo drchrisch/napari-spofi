@@ -17,8 +17,8 @@
 	"_spot_radius_comment": "spot_radius defines to which extent (px!) annotation points are expanded, should match actual spot size",
 	"spot_radius": {
 		"z": 3,
-		"y": 3,
-		"x": 3
+		"y": 6,
+		"x": 6
 	},
 	"_spot_display_radius_comment": "spot_display_radius defines the size of spots in viewer presentation",
 	"spot_display_radius" : [2, 2, 2],
