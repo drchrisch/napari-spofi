@@ -1,7 +1,7 @@
 QLabel {
     border: 2px solid #8f8f91;
     border-radius: 4px;
-    background-color: honeydew;
+    background-color: aqua;
     min-width: 100px;
     padding: 2px;
     color: #2F4F4F;

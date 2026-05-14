@@ -82,7 +82,7 @@ class Training(QWidget):
                        value=None, visible=False,
                        ),
         model_names=dict(widget_type="Label", label="model", value="_ -> _", visible=True),
-        number_of_epochs=dict(widget_type="Slider", min=10, max=5e3, step=10, value=100, visible=True),
+        number_of_epochs=dict(widget_type="Slider", min=10, max=1e3, step=10, value=100, visible=True),
         start_stop_button=dict(widget_type="PushButton", text="START"),
         losses=dict(widget_type="LineEdit", label="losses", value="epoch loss val_loss"),
         layout="vertical",

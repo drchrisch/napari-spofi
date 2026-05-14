@@ -1,4 +1,4 @@
-import ast
+import re
 import warnings
 import h5py
 from typing import List
@@ -59,6 +59,10 @@ class Annotation(QWidget):
             self.widget.fg_channels.value = self.data.new_args["fg_channel"]
             self.widget.bg_channels.choices = [self.data.new_args["bg_channel"], ]
             self.widget.bg_channels.value = self.data.new_args["bg_channel"]
+            self.widget.extraction_procedures.choices = _data.spot_extraction_procedures
+            self.widget.extraction_procedures.value = _data.default_spot_extraction_procedure
+            self.widget.spot_radius.choices = _data.spot_radii
+            self.widget.spot_radius.value = _data.spot_radii[0]
 
         @self.widget.img_dir.changed.connect
         def img_dir_change(img_dir):
@@ -68,6 +72,8 @@ class Annotation(QWidget):
             self.data.new_args["img_dir"] = img_dir.as_posix()
             # get image directory, screen image directory for h5 type files
             available_img_files = sorted([x.name for x in img_dir.glob(("*" + ".h5"))])
+            # filter available h5 files, skip 'projections.h5'
+            available_img_files = [f for f in available_img_files if not re.search("projections.h5", f)]
             # filter available h5 files, get names matching typical ScanImage output names
             # filenames = [f for f in filenames if re.search(r"(.*\d{5}\.h5)", f)]
             self.data.new_args["img_files"] = available_img_files
@@ -149,14 +155,27 @@ class Annotation(QWidget):
             self.data.new_args["bg_channel"] = bg_channel
             self.set_button_state(button=self.widget.load_img_button.native, state="not ok")
 
+        @self.widget.extraction_procedures.changed.connect
+        def extraction_procedure_change(procedure):
+            if isinstance(procedure, type(None)):
+                return
+            self.data.spot_extraction_procedure = procedure
+            self.set_button_state(button=self.widget.suggest_spots_button.native, state="not ok")
+            self.set_button_state(button=self.widget.extract_spots_button.native, state="not ok")
+
         @self.widget.spot_radius.changed.connect
         def spot_radius_event(event):
-            try:
-                spot_radius = ast.literal_eval(event)
-                self.set_button_state(button=self.widget.load_img_button.native, state="not ok")
-            except SyntaxError:
+            if isinstance(event, type(None)):
                 return
-            self.data.spot_radius = spot_radius
+            self.data.spot_radius = event
+            self.set_button_state(button=self.widget.suggest_spots_button.native, state="not ok")
+            self.set_button_state(button=self.widget.extract_spots_button.native, state="not ok")
+
+        @self.widget.spot_intensity_threshold.changed.connect
+        def spot_intensity_threshold_change(threshold):
+            self.set_button_state(button=self.widget.suggest_spots_button.native, state="not ok")
+            self.set_button_state(button=self.widget.extract_spots_button.native, state="not ok")
+            self.data.spot_intensity_threshold = threshold
 
         @self.widget.load_img_button.changed.connect
         def load_img():
@@ -178,14 +197,26 @@ class Annotation(QWidget):
             self.data.load_img()
             self.widget.raw_img_shape.value = f"{self.data.raw_img_shape}"
             self.set_button_state(button=self.widget.load_img_button.native, state="ok")
+            self.set_button_state(button=self.widget.suggest_spots_button.native, state="ok")
+            self.set_button_state(button=self.widget.extract_spots_button.native, state="ok")
+
+        @self.widget.suggest_spots_button.changed.connect
+        def suggest_spots():
+            """
+            suggest spots
+            add suggested spot positions to "suggested" spots layer
+            """
+            self.data.suggest_spots()
+            self.set_button_state(button=self.widget.suggest_spots_button.native, state="ok")
 
         @self.widget.extract_spots_button.changed.connect
         def extract_spots():
             """
             extract spots and associated data
-            add spots from current image to true spots layer
+            add spots from current image to true spots data
             """
             self.data.extract_spots()
+            self.set_button_state(button=self.widget.extract_spots_button.native, state="ok")
 
     def _on_init(widget):
         # initial settings
@@ -193,7 +224,7 @@ class Annotation(QWidget):
         widget.native.setStyleSheet(open(path / "resources" / "styles.qss", 'r').read())
         widget.raw_img_shape.native.setSizePolicy(QSizePolicy.MinimumExpanding, QSizePolicy.MinimumExpanding)
         widget.spot_radius.native.setSizePolicy(QSizePolicy.MinimumExpanding, QSizePolicy.MinimumExpanding)
-
+        widget.spot_intensity_threshold.native.setSizePolicy(QSizePolicy.MinimumExpanding, QSizePolicy.MinimumExpanding)
         widget.annotation_dir.value = _data.annotation_dir
         widget.annotation_dir.native.setToolTip("chose annotation directory")
         widget.img_dir.value = _data.img_dir
@@ -202,8 +233,14 @@ class Annotation(QWidget):
         widget.fg_channels.value = _data.default_fg_channel
         widget.bg_channels.choices = [_data.default_bg_channel, ]
         widget.bg_channels.value = _data.default_bg_channel
-        widget.spot_radius.value = _data.spot_radius
-        widget.spot_radius.native.setToolTip("set characteristic spot size (zyx, px), run 'extract spots' if changed!")
+        widget.extraction_procedures.choices = _data.spot_extraction_procedures
+        widget.extraction_procedures.value = _data.default_spot_extraction_procedure
+        widget.extraction_procedures.native.setToolTip("chose extraction procedure (threshold or DOG + watershed), run 'extract spots' if changed!")
+        widget.spot_radius.choices = _data.spot_radii
+        widget.spot_radius.value = _data.spot_radii[0]
+        widget.spot_radius.native.setToolTip("set characteristic spot radius (px), run 'extract spots' if changed!")
+        widget.spot_intensity_threshold.value = _data.spot_intensity_threshold
+        widget.spot_intensity_threshold.native.setToolTip("set relative intensity for spot handling, run 'extract spots' if changed!")
 
     @magic_factory(
         widget_init=_on_init,
@@ -226,12 +263,16 @@ class Annotation(QWidget):
                          choices=[None, ],
                          value=None, nullable=False,
                          ),
-        spot_radius=dict(widget_type="LiteralEvalLineEdit", label="spot radius",
-                         value=None, nullable=False,
-                         ),
         raw_img_shape=dict(widget_type="Label", label="image shape", value="(0, 0, 0)"),
         load_img_button=dict(widget_type="PushButton", text="load image"),
+        suggest_spots_button=dict(widget_type="PushButton", text="suggest spots"),
         extract_spots_button=dict(widget_type="PushButton", text="extract spots"),
+        extraction_procedures=dict(widget_type="ComboBox", label="procedure",
+                                   choices=[None, ], value=None, nullable=False),
+        spot_radius=dict(widget_type="ComboBox", label="spot radius",
+                         choices=[None, ], value=None, nullable=False,
+                         ),
+        spot_intensity_threshold=dict(widget_type="FloatSlider", min=0.0, max=1.0, step=0.01, value=0., visible=True),
         layout="vertical",
         persist=False,
         call_button=False,
@@ -243,10 +284,13 @@ class Annotation(QWidget):
                      img_files: List,
                      fg_channels,
                      bg_channels,
-                     spot_radius,
                      raw_img_shape,
                      load_img_button,
+                     suggest_spots_button,
                      extract_spots_button,
+                     extraction_procedures,
+                     spot_radius,
+                     spot_intensity_threshold: float,
                      ) -> None:
         ...
 

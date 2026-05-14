@@ -83,15 +83,6 @@ class Prediction(QWidget):
 
             print(f"load prediction: {prediction_file=}")
 
-            # check that prediction channel matches annotation channel
-            with h5py.File(prediction_file, 'r') as f:
-                if np.all((self.data.fg_channel in f.keys(),
-                           self.data.bg_channel in f.keys())):
-                    pass
-                else:
-                    print("annotation and prediction channel do not match")
-                    return
-
             spot_table_file = (Path(self.data.annotation_dir) / "SD_data" / "predictions" / img_dir_name /
                                f"{img_file.replace('.h5', '')}_spot_table_{model_name}.csv")
 
@@ -102,6 +93,15 @@ class Prediction(QWidget):
             if not np.all([f.exists() for f in [prediction_file, spot_table_file]]):
                 print("no prediction data found")
                 return
+
+            # check that prediction channel matches annotation channel
+            with h5py.File(prediction_file, 'r') as f:
+                if np.all((self.data.fg_channel in f.keys(),
+                           self.data.bg_channel in f.keys())):
+                    pass
+                else:
+                    print("annotation and prediction channel do not match")
+                    return
 
             # load prediction
             spot_table = pd.read_csv(spot_table_file)
@@ -139,37 +139,26 @@ class Prediction(QWidget):
             else:
                 self.data.annotation_data["predicted"] = spots_df
 
-            for idx, spot_type, editable in zip(range(1, 3), ["edited", "predicted"], [True, False]):
-                name = spot_type
-                df_ = spot_table
-                if len(df_) == 0:
-                    spot_pos = np.zeros((1, 3))
+            df_ = spot_table
+            if len(df_) == 0:
+                spot_pos = []  # np.zeros((1, 3))
+            else:
+                # prepare points layer
+                spot_pos = spot_table.loc[:, ["z", "y", "x"]].to_numpy()
+                if spot_pos.shape[0] == 0:
+                    spot_pos = []  # np.zeros((1, 3))
                 else:
-                    # prepare points layer
-                    spot_pos = spot_table.loc[:, ["z", "y", "x"]].to_numpy()
-                    if spot_pos.shape[0] == 0:
-                        spot_pos = np.zeros((1, 3))
-                    else:
-                        spot_pos = list(spot_pos)
-                # replace existing spot layers
-                if np.any([layer.name == name for layer in self.viewer.layers]):
-                    self.viewer.layers[name].data = spot_pos
-                else:
-                    self.viewer.add_points(
-                        data=spot_pos,
-                        name=name,
-                        ndim=3,
-                        n_dimensional=True,
-                        symbol="diamond",
-                        size=6,
-                        edge_width=0.1,
-                        edge_color=self.data.edge_colors[idx],
-                        face_color=self.data.face_colors[idx],
-                        blending="additive",
-                        opacity=0.8,
-                        visible=True,
-                    )
-                self.viewer.layers[name].editable = editable
+                    spot_pos = list(spot_pos)
+            # replace existing spot layers
+            if np.any([layer.name == "predicted" for layer in self.viewer.layers]):
+                self.viewer.layers["predicted"].data = spot_pos
+            else:
+                self.data.add_spots_layer(data=spot_pos, name="predicted", symbol="star",  # "diamond",
+                                          size=8,
+                                          border_color=self.data.border_colors[1],
+                                          face_color=self.data.face_colors[1],
+                                          editable=False,
+                                          )
 
         @self.widget.threshold.changed.connect
         def threshold_change(threshold):
@@ -189,7 +178,7 @@ class Prediction(QWidget):
                        ),
         predict_button=dict(widget_type="PushButton", text="Predict"),
         load_prediction_button=dict(widget_type="PushButton", text="Load prediction"),
-        threshold=dict(widget_type="FloatSlider", min=0.01, max=1.0, step=0.05, value=0.5, visible=True),
+        threshold=dict(widget_type="FloatSlider", min=0.01, max=1.0, step=0.01, value=0.5, visible=True),
         layout="vertical",
         persist=False,
         call_button=False,

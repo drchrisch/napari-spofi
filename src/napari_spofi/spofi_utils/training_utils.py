@@ -1,5 +1,5 @@
 """
-some helper functions for napari spot it training
+some helper functions for napari spofi training
 """
 
 import numpy as np
@@ -7,10 +7,16 @@ from pathlib import Path
 from tifffile import imread
 from tqdm.notebook import tqdm
 from pprint import pprint
-# from tensorflow.config import get_visible_devices
+from tensorflow.config import get_visible_devices
 from tensorflow.keras.utils import Sequence
 from tensorflow.keras.callbacks import Callback
 from functools import lru_cache
+
+from stardist.models import Config3D, StarDist3D
+from stardist import Rays_GoldenSpiral
+from stardist import calculate_extents
+from stardist import relabel_image_stardist3D
+from stardist.matching import matching_dataset
 
 
 class FileData(Sequence):
@@ -40,7 +46,6 @@ class TrainingUtils:
         self.training_widget = parent.widget
         self.model_dir = Path(self.data.model_dir)
 
-        # check for sd_ directories, prepare data directories
         self.sd_images = Path(self.data.sd_images)
         self.sd_masks = Path(self.data.sd_masks)
         self.validation_fraction = self.data.validation_fraction
@@ -49,7 +54,6 @@ class TrainingUtils:
         self.stop_training = False
 
         # check gpu
-        from tensorflow.config import get_visible_devices
         print(get_visible_devices())
 
         # load image and label data
@@ -113,6 +117,7 @@ class TrainingUtils:
         # augmentation for two channel (do not touch channel order) input
         # find out what to do
         yes_or_no = np.random.randint(0, 6, 1)
+        # print('yes_or_no', yes_or_no)
         # flip updown
         if yes_or_no == 0:
             img = np.flip(img, axis=0)
@@ -120,6 +125,8 @@ class TrainingUtils:
         # flip leftright
         elif yes_or_no == 1:
             img = np.flip(img, axis=(2, 1))
+            # img[...,0] = np.flip(img[...,0], axis=(2,1))
+            # img[...,1] = np.flip(img[...,1], axis=(2,1))
             mask = np.flip(mask, axis=(2, 1))
         # transpose
         elif yes_or_no == 2:
@@ -151,16 +158,8 @@ class TrainingUtils:
         return x, y
 
     def get_model(self):
-        from stardist import gputools_available
-        from stardist import Rays_GoldenSpiral
-        from stardist.models import Config3D, StarDist3D
-        from stardist import calculate_extents
-
         # Use OpenCL-based computations for data generator during training (requires 'gputools')
-        use_gpu = True and gputools_available()
-        if use_gpu:
-            from csbdeep.utils.tf import limit_gpu_memory
-            limit_gpu_memory(None, allow_growth=True)
+        use_gpu = False  # STRANGE SETTING!!!
 
         # check if new model should be started with new configs or existing configs should be used
         if (self.model_dir / "config.json").exists():
@@ -184,11 +183,12 @@ class TrainingUtils:
                 n_channel_in=n_channel,
                 n_classes=None,
                 train_patch_size=self.train_patch_size,
-                train_batch_size=1,
+                train_batch_size=3,
                 unet_n_depth=3,
                 train_sample_cache=False,
             )
             print(conf)
+            # vars(conf)
 
             model = StarDist3D(conf, name=self.model_dir.name, basedir=self.model_dir.parent)
 
@@ -196,6 +196,7 @@ class TrainingUtils:
         model.prepare_for_training()
         training_stop_callback = self.StopCallback(self)
         report_callback = self.ReportCallback(self)
+        # model.callbacks.append(LambdaCallback(on_epoch_end=lambda a, c: print("Y")))
         model.callbacks.append(report_callback)
         model.callbacks.append(training_stop_callback)
         print(model.callbacks)
@@ -217,8 +218,8 @@ class TrainingUtils:
 
         """
         plt.figure(figsize=(8,5))
-        plt.plot(n_rays, self.scores_iso,   'o-', label='Isotropic')
-        plt.plot(n_rays, self.scores_aniso, 'o-', label='Anisotropic')
+        plt.plot(n_rays, scores_iso,   'o-', label='Isotropic')
+        plt.plot(n_rays, scores_aniso, 'o-', label='Anisotropic')
         plt.xlabel('Number of rays for star-convex polyhedra')
         plt.ylabel('Reconstruction score (mean intersection over union)')
         plt.legend();
@@ -228,16 +229,12 @@ class TrainingUtils:
 
     def get_spot_anisotropy(self):
         # calculate anisotropy (from labels)
-        from stardist import calculate_extents
         extents = calculate_extents(self.masks)
         self.anisotropy = tuple(np.max(extents) / extents)
         return self.anisotropy
 
     def reconstruction_scores(self, n_rays, anisotropy=None):
         # estimate anisotropy effect
-        from stardist import Rays_GoldenSpiral
-        from stardist import relabel_image_stardist3D
-        from stardist.matching import matching_dataset
         scores = []
         for r in tqdm(n_rays):
             rays = Rays_GoldenSpiral(r, anisotropy=anisotropy)
@@ -252,7 +249,7 @@ class TrainingUtils:
         self.model.train(self.imgs_trn, self.masks_trn,
                          validation_data=(self.imgs_val, self.masks_val),
                          augmenter=self.augmenter,
-                         epochs=self.number_of_epochs,  # 200 epochs seem to be enough for synthetic demo dataset
+                         epochs=self.number_of_epochs,
                          steps_per_epoch=self.steps_per_epoch,
                          )
 
@@ -268,6 +265,11 @@ class TrainingUtils:
             if self.args.stop_training:
                 print(f"training stopped after epoch {epoch + 1}")
                 self.model.stop_training = True
+            """
+            if (logs.get('losses') <= 0.05):
+                    print("\n\n\nReached 0.05 losses value so cancelling training!\n\n\n")
+                    self.model.stop_training = True
+            """
 
     class ReportCallback(Callback):
         def __init__(self, args):
@@ -275,9 +277,14 @@ class TrainingUtils:
             self.args = args
 
         def on_epoch_end(self, epoch, logs={}):
+            # keys = list(logs.keys())
+            # print(f"End epoch {epoch} of training; got log keys: {keys}")
+
             loss = logs.get('loss')
             val_loss = logs.get('val_loss')
             print(f"\t***** training: {epoch}, {loss}, validation: {val_loss} *****")
             self.args.training_widget.losses.value = f"{epoch=:4n} * {loss=:.2f} * {val_loss=:.2f}"
             self.args.data.losses['training'].append(loss)
             self.args.data.losses['validation'].append(val_loss)
+
+

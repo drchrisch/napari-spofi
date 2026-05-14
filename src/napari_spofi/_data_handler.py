@@ -11,23 +11,32 @@ from napari.layers import Points
 import numpy as np
 import pandas as pd
 import h5py
-import pyclesperanto as cle
 from PIL import Image as PImage, ImageDraw
 from tifffile import imwrite
 from scipy import ndimage as ndi
-from skimage.segmentation import expand_labels
+from skimage.feature import blob_log
+from skimage.filters import difference_of_gaussians
 from skimage.measure import regionprops_table
+from skimage.segmentation import expand_labels
+from skimage.segmentation import watershed
 from qtpy.QtWidgets import QWidget, QMessageBox
 from .spofi_utils.directory_maker import directory_maker
 from .spofi_utils.normalizer import get_normalization_limits
 from .spofi_utils.normalizer import normalize_to_range
 
+
+# check use of gpu
 try:
+    from stardist import gputools_available
+    if gputools_available():
+        from csbdeep.utils.tf import limit_gpu_memory
+        limit_gpu_memory(0.8, allow_growth=False, total_memory=6000)
+    import pyclesperanto as cle
     print("Available OpenCL devices:" + str(cle.available_device_names()))
     cle.select_device()  # defaults to None
     print("Using OpenCL device: " + cle.get_device().name)
-except Exception as e:
-    print(e, traceback.format_exc())
+except Exception as excptn:
+    print(excptn, traceback.format_exc())
 
 
 class DataHandler:
@@ -59,7 +68,7 @@ class DataHandler:
         self.model = None
 
     def set_new_args(self):
-        self.new_args["annotation_data"] = {k: self.make_spots_df() for k in ("true", "edited", "predicted")}
+        self.new_args["annotation_data"] = {k: self.make_spots_df() for k in ("true", "predicted")}
         self.new_args["annotation_dir"] = (Path(self.default_annotation_dir)).as_posix()
         self.new_args["img_dir"] = (Path(self.default_img_dir) / "None").as_posix()
         self.new_args["model_dir"] = (Path(self.default_model_dir) / "None").as_posix()
@@ -151,11 +160,11 @@ class DataHandler:
         draw = ImageDraw.Draw(tiles_img)
         draw.rectangle(xy=(ul, lr), fill=0, outline=tile_color, width=1)
         self.viewer.layers["tiles"].data = np.array(tiles_img)
-        # self.viewer.layers["tiles"].interpolation = "linear"
-        # self.viewer.layers["tiles"].interpolation2d = "linear"
-        # self.viewer.layers["tiles"].interpolation3d = "linear"
+        self.viewer.layers["tiles"].interpolation2d = "nearest"
+        self.viewer.layers["tiles"].interpolation3d = "nearest"
 
-        #self.update()
+    def add_predicted_spots_to_tile(self, cursor_pos):
+        print("one could imagine to add predicted spots from this tile to 'true' spots...")
 
     def load_img(self):
         # check for new start (self.annotation_file still None)
@@ -194,11 +203,15 @@ class DataHandler:
                         name=channels[idx],
                         colormap=self.viewer_colors[idx],
                         blending="additive",
-                        # interpolation3d="nearest",
-                        # interpolation="nearest",
+                        interpolation2d="nearest",
+                        interpolation3d="nearest",
                         )
 
-            self.add_spots_layer()
+            self.add_spots_layer(name="true", symbol="disc",
+                                 border_color=self.border_colors[0],
+                                 face_color=self.face_colors[0],
+                                 editable=True
+                                 )
 
             # add points layer, add know points from annotation data
             annotation_files = sorted([f.stem for f in Path(self.annotation_dir).glob(("annotation_data*" + ".pickle"))], reverse=True)
@@ -236,17 +249,20 @@ class DataHandler:
         with h5py.File(Path(self.img_dir) / self.img_file, "r", ) as f:
             for idx in range(len(channels)):
                 img = f[channels[idx]][self.img_slice]
-                img = self.blur_it(img)
                 self.viewer.add_image(
                     data=img,
                     name=channels[idx],
                     colormap=self.viewer_colors[idx],
                     blending="additive",
-                    # interpolation3d="nearest",
-                    # interpolation="nearest",
+                    interpolation2d="nearest",
+                    interpolation3d="nearest",
                     )
 
-        self.add_spots_layer()
+        self.add_spots_layer(name="true", symbol="disc",
+                             border_color=self.border_colors[0],
+                             face_color=self.face_colors[0],
+                             editable=True,
+                             )
 
         # add points layer, add know points from annotation data
         annotation_files = sorted([f.stem for f in Path(self.annotation_dir).glob(("annotation_data*" + ".pickle"))], reverse=True)
@@ -266,18 +282,18 @@ class DataHandler:
         sigmas = self.display_blur_sigmas
         if len(sigmas) == 1:
             sigmas = np.repeat(sigmas, 3)
-        img = cle.pull(cle.gaussian_blur(img, sigma_z=sigmas[0], sigma_y=sigmas[1], sigma_x=sigmas[2]))
+        try:
+            img = cle.pull(cle.gaussian_blur(cle.push(img), sigma_z=sigmas[0], sigma_y=sigmas[1], sigma_x=sigmas[2]))
+        except Exception as excptn:
+            print(f"pyclesperanto gaussian_blur error: {excptn}")
         return img
 
     def get_spots(self):
-        # check spots in 'true' and 'edited' layer
-        spot_types = ("true", "edited")
-        spot_pos = {key: [] for key in spot_types}
-        for spot_type in spot_types:
-            for layer in self.viewer.layers:
-                if isinstance(layer, Points) & (layer.name == spot_type):
-                    # get spots from layer
-                    spot_pos[spot_type] = layer.data[[np.sum(x) > 0 for x in layer.data]]  # pos(0,0,0) special!
+        # check spots in 'true' layer
+        spot_pos = {"true": []}
+        for layer in self.viewer.layers:
+            if isinstance(layer, Points) & (layer.name == "true"):
+                spot_pos["true"] = layer.data[[np.sum(x) > 0 for x in layer.data]]  # pos(0,0,0) special!
         return spot_pos
 
     def calc_img_slice(self):
@@ -287,22 +303,27 @@ class DataHandler:
         if raw_img_shape[0] < self.img_shape[0]:
             # raise Exception("image z axis < 64")
             warnings.warn("image z axis < 64")
-        if raw_img_shape[0] > self.img_shape[0] or raw_img_shape[1] > self.img_shape[1]:
-            img_slice_z = slice(
-                int(raw_img_shape[0] / 2 - int(self.img_shape[0] / 2)),
-                int(raw_img_shape[0] / 2 + int(self.img_shape[0] / 2)),
-            )
+        if raw_img_shape[0] >= self.img_shape[0]:
+            if isinstance(self.slice_mode, str):
+                if self.slice_mode == "center":
+                    img_slice_z = slice(
+                        int(raw_img_shape[0] / 2 - int(self.img_shape[0] / 2)),
+                        int(raw_img_shape[0] / 2 + int(self.img_shape[0] / 2)),
+                    )
+                if self.slice_mode == "top":
+                    img_slice_z = slice(0, self.img_shape[0])
+        if raw_img_shape[1] >= self.img_shape[1]:
             img_slice_xy = slice(
                 int(raw_img_shape[1] / 2 - int(self.img_shape[1] / 2)),
                 int(raw_img_shape[1] / 2 + int(self.img_shape[1] / 2)),
             )
-            img_slice = (
-                img_slice_z,
-                img_slice_xy,
-                img_slice_xy,
-            )
         else:
-            img_slice = slice(0, self.img_shape[0])
+            img_slice_xy = slice(0, self.img_shape[1])
+        img_slice = (
+            img_slice_z,
+            img_slice_xy,
+            img_slice_xy,
+            )
         print(
             f"\tinput image size: {raw_img_shape}, actually used region: {img_slice} to match default size {self.img_shape}\n"
         )
@@ -324,9 +345,8 @@ class DataHandler:
                     self.viewer.layers.remove(layer)
             self.viewer.layers["tiles"].data = np.zeros(self.img_shape[1:])
             self.viewer.dims.ndisplay = 3
-            # self.viewer.layers["tiles"].interpolation = "linear"
-            # self.viewer.layers["tiles"].interpolation2d = "linear"
-            # self.viewer.layers["tiles"].interpolation3d = "linear"
+            self.viewer.layers["tiles"].interpolation2d = "nearest"
+            self.viewer.layers["tiles"].interpolation3d = "nearest"
         except Exception as e:
             print(e, traceback.format_exc())
 
@@ -334,7 +354,6 @@ class DataHandler:
         """
         dump annotation data
         """
-        # print(f"dump data: {self.annotation_file}")
         with open(self.annotation_file, "wb") as f:
             pickle.dump(self.annotation_data[spot_type], f, pickle.HIGHEST_PROTOCOL)
 
@@ -403,31 +422,31 @@ class DataHandler:
                 # remove normalization data!
                 self.normalization_type = normalization_type_from_file
                 print(f"new normalization type: {normalization_type_from_file}")
-                """
-                for idx in range(len(annotation_data)):
-                    annotation_data.at[idx, "normalization_type"] = normalization_type_from_file
-                    annotation_data.at[idx, "normalization_values"] = np.empty(0, dtype=object)
-                """
             else:
                 warnings.warn("Check normalization type settings!")
                 return
 
-    def add_spots_layer(self):
-        spots = np.zeros((1, 3))
+    def add_spots_layer(self, data=np.zeros((1, 3)), name="true", symbol="disc",
+                        size=6,
+                        border_color="green",
+                        face_color="red",
+                        editable=True,
+                        ):
         self.viewer.add_points(
-            data=spots,
-            name="true",
+            data=data,
+            name=name,
             ndim=3,
             n_dimensional=True,
-            symbol="disc",
-            size=6,
-            edge_width=0.1,
-            edge_color=self.edge_colors[0],
-            face_color=self.face_colors[0],
+            symbol=symbol,
+            size=size,
+            border_width=0.1,
+            border_color=border_color,
+            face_color=face_color,
             blending="additive",
             opacity=0.8,
             visible=True,
         )
+        self.viewer.layers[name].editable=editable
 
     def update_annotation_data(self):
         # get spots from active image
@@ -443,7 +462,7 @@ class DataHandler:
         active_tiles = [idx for idx in self.tile_ids.keys() if self.tile_ids[idx]["is_active"] > 0]
 
         # calculate tile positions, prepare spots dataframes
-        spot_types = ["true", "edited"]
+        spot_types = ["true", ]
         spots_df = {key: self.make_spots_df() for key in spot_types}
         for spot_type in spot_types:
             if len(spot_pos[spot_type]) > 0:
@@ -463,35 +482,6 @@ class DataHandler:
                     spots_df[spot_type].at[idx, "normalization_range"] = self.normalization_range
                     spots_df[spot_type].at[idx, "normalization_values"] = normalization_values
                 spots_df[spot_type]["timestamp"] = pd.Timestamp("now")
-
-        # check 'edited' spots in active tiles
-        # consider only spots in active tiles and move those to 'true'
-        # replace 'true' spots that are (too) close to 'edited' spots by 'edited' spots
-        spot_pos_true = spots_df["true"].copy()
-        spot_pos_true_data = spot_pos_true.spot_pos.to_numpy()
-        spot_pos_edited = spots_df["edited"].loc[(spots_df["edited"]["active_tile"] != -1), ].copy()
-        spot_pos_edited_data = spot_pos_edited.spot_pos.to_numpy()
-        if spot_pos_edited_data.shape[0] > 0:
-            # get voxel size to account for non-isotropic image dimension
-            voxel_size = self.voxel_size / np.min(self.voxel_size)
-            voxel_size = voxel_size[::-1]  # xyz -> zyx
-
-            # calculate 'true' <-> 'edited' spot distances
-            spot_pos_true_data = [np.multiply(voxel_size, x) for x in spot_pos_true_data]
-            spot_pos_edited_data = [np.multiply(voxel_size, x) for x in spot_pos_edited_data]
-
-            # identify 'true' spots where distance to 'edited' spot is less than min_dist (=5) 'units'
-            min_dist = 5
-            valid_true_spot_ids = []
-            for pos_true in spot_pos_true_data:
-                pp_diff = [(pos_true - pos_edited) for pos_edited in spot_pos_edited_data]
-                pp_dist = [np.sqrt(np.sum(x ** 2)) for x in pp_diff]
-                valid_true_spot_ids.append(np.all([x >= min_dist for x in pp_dist]))
-            valid_true_spot_ids = np.where(valid_true_spot_ids)
-
-            # update 'true' spots
-            spots_df["true"] = spots_df["true"].iloc[valid_true_spot_ids]
-            spots_df["true"] = pd.concat([spots_df["true"], spot_pos_edited], sort=False, ignore_index=True)
 
         # get known/loaded 'true' annotation data (from other images)
         current_annotation_data = self.annotation_data["true"].copy()
@@ -579,27 +569,18 @@ class DataHandler:
             & (df["bg_channel"] == self.bg_channel)
             ]
         if len(df) == 0:
-            spots = np.zeros((1, 3))
+            spots = []  # np.zeros((1, 3))
         else:
             spots = list(df["spot_pos"].to_numpy())
 
         if np.any([layer.name == "true" for layer in self.viewer.layers]):
             self.viewer.layers["true"].data = spots
         else:
-            self.viewer.add_points(
-                data=spots,
-                name="true",
-                ndim=3,
-                n_dimensional=True,
-                symbol="disc",
-                size=6,
-                edge_width=0.1,
-                edge_color=self.edge_colors[0],
-                face_color=self.face_colors[0],
-                blending="additive",
-                opacity=0.8,
-                visible=True,
-            )
+            self.add_spots_layer(data=spots, name="true", symbol="disc",
+                                 border_color=self.border_colors[0],
+                                 face_color=self.face_colors[0],
+                                 editable=True,
+                                 )
 
         # reset current tile idx list
         self.tile_ids = dict()
@@ -628,9 +609,8 @@ class DataHandler:
             draw.rectangle(xy=(ul, lr), fill=0, outline=tile_color, width=1)
 
         self.viewer.layers["tiles"].data = np.array(tiles_img)
-        # self.viewer.spot_layers["tiles"].interpolation = "linear"
-        # self.viewer.spot_layers["tiles"].interpolation2d = "linear"
-        # self.viewer.spot_layers["tiles"].interpolation3d = "linear"
+        self.viewer.layers["tiles"].interpolation2d = "nearest"
+        self.viewer.layers["tiles"].interpolation3d = "nearest"
 
     def _get_ul_lr(self, pos):
         ul = (int(pos[2] * self.tile_shape[2] + 0), int(pos[1] * self.tile_shape[1] + 0))
@@ -643,6 +623,61 @@ class DataHandler:
     def _to_tiles(self, x):
         # Sort each sublist
         return [int(y // self.tile_shape[i]) for (i, y) in enumerate(x)]
+
+    def suggest_spots(self):
+        """
+        suggest spots for active tiles based on Laplacian of Gaussian, add suggested spots to "suggested" layer
+        """
+
+        print("suggesting spots")
+
+        # get image, use foreground channel (id==0) to find spots
+        with h5py.File(Path(self.new_args['img_dir']) / self.new_args['img_file'], "r") as f:
+            img = f[self.fg_channel][self.img_slice]
+
+        # pad img in xy
+        t_pad = self.tile_shape[0] // 2
+        img_padded = np.pad(img, ((0, 0), (t_pad, t_pad), (t_pad, t_pad)), mode="constant", constant_values=0)
+
+        # iterate over tiles
+        print(f"{self.new_args['img_dir']}, {self.new_args['img_file']}, {self.tile_ids=}")
+        spot_pos = []
+        for tile_id in self.tile_ids.keys():
+            tile = self.tile_ids[tile_id]
+            if tile['is_active'] == -1:
+                continue
+            # increase tile positions in xy
+            tile_slice = tile['tile_slice']
+            starts = [(x.start - 0) for (x, p) in zip(tile_slice, [0, t_pad, t_pad])]
+            stops = [(x.stop + 2*p) for (x, p) in zip(tile_slice, [0, t_pad, t_pad])]
+            tile_slice_padded = (slice(starts[0], stops[0]),
+                                 slice(starts[1], stops[1]),
+                                 slice(starts[2], stops[2]))
+
+            img_tile_padded = img_padded[tile_slice_padded]
+
+            # find spots, add spot positions to dummy array
+            blobs = blob_log(img_tile_padded, min_sigma=0., max_sigma=1.5, num_sigma=2, threshold=None, overlap=0.5, log_scale=False, threshold_rel=0.1, exclude_border=True)
+            if len(blobs) > 0:
+                # get absolute positions
+                spot_pos_ = blobs[:, :3]
+                spot_pos_[:, 1] = spot_pos_[:, 1] + starts[1] - t_pad
+                spot_pos_[:, 2] = spot_pos_[:, 2] + starts[2] - t_pad
+                spot_pos.append(spot_pos_)
+        if len(spot_pos):
+            spot_pos = np.vstack(spot_pos)
+            spot_pos = np.unique(spot_pos, axis=0)
+
+        # replace existing suggested spot layers
+        if np.any([layer.name == "suggested" for layer in self.viewer.layers]):
+            self.viewer.layers["suggested"].data = spot_pos
+        else:
+            self.add_spots_layer(data=spot_pos, name="suggested", symbol="x",
+                                 size=8,
+                                 border_color=self.border_colors[2],
+                                 face_color=self.face_colors[2],
+                                 editable=False,
+                                 )
 
     def extract_spots(self):
         # update annotation data
@@ -665,7 +700,7 @@ class DataHandler:
                         normalization_values = _df.iloc[idx]["normalization_values"]
                         break
                 if not isinstance(normalization_values, dict):
-                    print(f"{img_dir}, {img_file}, calculating normalization values")
+                    # print(f"{img_dir}, {img_file}, calculating normalization values")
                     channels = [self.fg_channel, self.bg_channel]
                     normalization_values = get_normalization_limits(
                         path=Path(img_dir),
@@ -675,155 +710,154 @@ class DataHandler:
                         norm_type=self.normalization_type,
                     )
 
-                idxs = self.annotation_data["true"].loc[
+                ids = self.annotation_data["true"].loc[
                     (self.annotation_data["true"]["img_dir"] == img_dir)
                     & (self.annotation_data["true"]["img_file"] == img_file)].index
-                for idx in idxs:
+                for idx in ids:
                     self.annotation_data["true"].at[idx, "normalization_values"] = normalization_values
 
         self.dump_data()
         self.make_training_tiles()
 
+    @staticmethod
+    def get_props(mask, img):
+        spot_props = regionprops_table(mask, intensity_image=img,
+                                       properties=('label', 'centroid_weighted', 'area', 'intensity_max', 'equivalent_diameter_area'),
+                                       extra_properties=None, cache=True, separator='-', )
+        spot_props = pd.DataFrame(spot_props)
+        spot_props.rename(columns={"centroid_weighted-0": "centroid_z", "centroid_weighted-1": "centroid_y", "centroid_weighted-2": "centroid_x"}, inplace=True)
+        return spot_props
+
     def make_training_tiles(self):
         """
         make img and mask tiles for training
         """
+        if self.spot_extraction_procedure == 1:
+            print(f"create spot mask with procedure: {self.spot_extraction_procedure}, using spot intensity threshold: {self.spot_intensity_threshold}")
+        if self.spot_extraction_procedure == 2:
+            print(f"create spot mask with procedure: {self.spot_extraction_procedure} (DOG + watershed)")
+
         # delete existing files in "images" and "masks" directory
         for file in sorted(Path(self.sd_images).rglob("*.tif")):
             (Path(self.sd_images) / file).unlink()
         for file in sorted(Path(self.sd_masks).rglob("*.tif")):
             (Path(self.sd_masks) / file).unlink()
 
-        # iterate over "true" annotation data in active tiles
+        # grasp "true" annotation data
         spot_type = "true"
         df = self.annotation_data[spot_type].copy()
-        df = df.loc[(df["active_tile"] > 0)]
 
-        for img_dir in df.img_dir.unique():
-            for img_file in df.loc[df["img_dir"] == img_dir, 'img_file'].unique():
-                _df = df.loc[
-                    (df["img_dir"] == img_dir)
-                    & (df["img_file"] == img_file)
-                    & (df["fg_channel"] == self.fg_channel)
-                    & (df["bg_channel"] == self.bg_channel),
-                ]
-                if len(_df) > 0:
-                    normalization_values = _df.iloc[0]["normalization_values"]
-                    img_id = _df.img_id.unique()[0]
-                    img_slice, fg_channel, bg_channel = _df.iloc[0][["img_slice", "fg_channel", "bg_channel"]]
-                    # iterate over tiles
-                    tile_ids = _df["tile_id"].unique()
-                    for tile_id in tile_ids:
-                        tile_slice = _df.loc[_df.tile_id == tile_id, "tile_slice"].unique()[0]
-                        # prepare image tile and mask tile file name
-                        file = f'img_{img_id:.0f}_{tile_id:05.0f}'
-                        # get tile from image file, prepare as (multichannel) image
-                        with h5py.File(Path(img_dir) / img_file, "r") as f:
-                            img_tile = np.stack([f[channel][eval(img_slice)][eval(tile_slice)]
-                                                 for channel in [fg_channel, bg_channel]],
-                                                axis=-1)
+        t_pad = self.tile_shape[0] // 2
+        tile_end_offset = (0, self.tile_shape[0], self.tile_shape[0])
+        tile_padded_offset = (0, t_pad, t_pad)
+        spot_expand_distance = (3 * self.spot_radius**2)**0.5
 
-                        # ensure that z tile shape matches default shape, pad with zeros
-                        tile_shape_raw = img_tile.shape
-                        img_tile = np.pad(img_tile,
-                                          ((0, self.tile_shape[0] - tile_shape_raw[0]), (0, 0), (0, 0), (0, 0)),
-                                          mode="constant",
-                                          constant_values=0,
-                                          )
+        # iterate over all annotated images
+        for img_dir in df['img_dir'].unique():
+            for img_file in df.loc[df['img_dir'] == img_dir, 'img_file'].unique():
+                spot_data = df.loc[(df['img_dir'] == img_dir)
+                                    & (df["img_file"] == img_file)
+                                    & (df["active_tile"] == 1),
+                ["img_id", "img_slice", "tile_id", "tile_slice", "spot_pos", "active_tile", "normalization_values"]].copy()
 
-                        # normalize
-                        img_tile = normalize_to_range(img_tile, normalization_values)
+                if not len(spot_data):
+                    continue
 
-                        # write image tile (multichannel) to file
-                        self._write_img_tile(img_tile=img_tile,
-                                             path=Path(self.sd_images),
-                                             file=file,
-                                             )
+                spot_data.reset_index(inplace=True)
 
-                        # prepare mask
-                        # get smoothed version of foreground channel
-                        img_tile_smoothed = ndi.gaussian_filter(img_tile[..., 0].astype(np.float32), 1, order=0,
-                                                                mode='constant', cval=0.0,
-                                                                truncate=4.0, radius=None, axes=None)
+                normalization_values = spot_data.iloc[0]["normalization_values"]
+                img_id = spot_data.iloc[0]["img_id"]
+                img_slice = spot_data.iloc[0]["img_slice"]
 
-                        # get conversion from tile to considered image slice
-                        starts = [x.start for x in eval(tile_slice)]
+                with h5py.File(Path(img_dir) / img_file, "r") as f:
+                    img = np.stack([f[channel][eval(img_slice)] for channel in [self.fg_channel, self.bg_channel]],
+                                   axis=-1)
+                # pad in xy
+                img_padded = np.stack([np.pad(img[..., i], ((0, 0), (t_pad, t_pad), (t_pad, t_pad)), mode="constant", constant_values=0) for i in range(2)], axis=-1)
 
-                        # create spot position array for all spots
-                        spot_pos_array = np.zeros_like(img_tile_smoothed, dtype=np.uint8)
+                # iterate over tiles
+                for tile_id, grp in spot_data.groupby("tile_id"):
+                    center_tile_slice = eval(grp.iloc[0].tile_slice)
+                    img_tile = np.stack([img[..., channel_id][center_tile_slice]
+                                        for channel_id in range(2)],
+                                        axis=-1)
+                    # normalize
+                    img_tile = normalize_to_range(img_tile, normalization_values)
 
-                        for p_idx, spot_pos in enumerate(_df.loc[_df.tile_id == tile_id, "spot_pos"], start=1):
-                            pos_coords = [(sp - s).astype(np.uint8) for (sp, s) in zip(spot_pos, starts)]
-                            spot_pos_array[tuple(pos_coords)] = p_idx
-                        del pos_coords
+                    # write image tile (multichannel, normalized data) to file
+                    file = f'img_{img_id:.0f}_{tile_id:05.0f}'
+                    self._write_img_tile(img_tile=img_tile,
+                                         path=Path(self.sd_images),
+                                         file=file,
+                                         )
 
-                        # expand spot positions
-                        _spot_radius = self.spot_radius
-                        spot_expand_distance = np.sqrt(
-                            np.sum([_spot_radius[key] ** 2 for key in _spot_radius.keys()]))
-                        del _spot_radius
-                        spot_pos_mask = expand_labels(spot_pos_array, distance=spot_expand_distance).astype(np.uint8)
+                    # increase tile in xy
+                    starts = [x.start for x in center_tile_slice]
+                    ends = [x.stop for x in center_tile_slice]
+                    ends = [(e + to) for (e, to) in zip(ends, tile_end_offset)]
+                    center_tile_slice_padded = (slice(starts[0], ends[0]),
+                                                slice(starts[1], ends[1]),
+                                                slice(starts[2], ends[2]))
 
-                        # check spot center position
-                        spot_props = regionprops_table(spot_pos_mask, intensity_image=img_tile_smoothed,
-                                                       properties=('label', 'centroid_weighted',
-                                                                   'intensity_max', 'equivalent_diameter_area'),
-                                                       cache=True, separator='-', extra_properties=None, spacing=None)
-                        pos_coords = []
-                        spot_radii = []
-                        spot_max = []
-                        for p_idx, lbl in enumerate(spot_props['label']):
-                            pos_coords = np.append(pos_coords, np.squeeze(
-                                [(spot_props[f"centroid_weighted-{idx}"][p_idx]).astype(np.uint16) for idx in range(3)]))
-                            # spot_radius = np.round(((np.sum(spot_pos_mask==p_idx) * 3 / np.pi / 4)**(1/3)), 2)
-                            spot_radius = np.round(spot_props['equivalent_diameter_area'][p_idx] / 2, 2)
-                            spot_radii = np.append(spot_radii, spot_radius)
-                            spot_max = np.append(spot_max, spot_props['intensity_max'])
-                        pos_coords = np.reshape(pos_coords, (-1, 3)).astype(np.uint16)
-                        del spot_radius
+                    # use foreground channel (id==0) to create mask
+                    img_tile_padded = img_padded[..., 0][center_tile_slice_padded]
 
-                        # create spot position array for all spots
-                        spot_pos_array = np.zeros_like(img_tile_smoothed, dtype=np.uint8)
-                        for p_idx, spot_pos in enumerate(pos_coords, start=1):
-                            spot_pos_array[tuple(spot_pos)] = p_idx
+                    # iterate over spots, add to dummy array
+                    spot_pos_array = np.zeros_like(img_tile_padded, dtype=np.uint16)
+                    for idx in spot_data.index:
+                        _spot_data = spot_data.iloc[idx][["tile_id", "tile_slice", "spot_pos"]]
+                        pos_coords_padded = [(sp - ts.start + tpo).astype(np.uint16) for (sp, ts, tpo) in
+                                             zip(_spot_data["spot_pos"], center_tile_slice_padded, tile_padded_offset)]
+                        # add spot positions to dummy array if in padded tile
+                        if np.all([x < 128 for x in pos_coords_padded]):
+                            spot_pos_array[tuple(pos_coords_padded)] = int(idx + 1)
 
-                        # expand spot positions (use median radius from regionprops)
-                        spot_expand_distance = (3 * (np.median(spot_radii) / 2) ** 2) ** 0.5
-                        mask_tile = expand_labels(spot_pos_array, distance=spot_expand_distance)
+                    # extend spot positions using expected spot radius
+                    spot_pos_mask = expand_labels(spot_pos_array, distance=spot_expand_distance)
 
-                        # filter by image intensity threshold
-                        # get histogram of pixel intensities, correct bin edges to get "x"
-                        counts, counts_x = np.histogram(img_tile_smoothed, bins=1024, density=True)
-                        counts_x = (counts_x + ((counts_x[1] - counts_x[0]) / 2))[:-1]
-                        """
-                        # get intensity value for max counts
-                        background = counts_x[np.argmax(counts)]
-                        """
-                        # get intensity value for max counts (5% of bins from low intensity edge)
-                        background = counts_x[np.argmax(counts[:int(1024 * 0.05)])]
+                    # get smoothed version of foreground channel
+                    img_tile_padded_smoothed = ndi.gaussian_filter(img_tile_padded.astype(np.float32), 1.0, order=0,
+                                                                   mode='constant', cval=0.0,
+                                                                   truncate=4.0, radius=None, axes=None)
+                    
+                    # get spot properties
+                    spot_props = self.get_props(spot_pos_mask, img_tile_padded_smoothed)
 
-                        for p_idx, lbl in enumerate(spot_props['label']):
-                            mask_tile = np.where((mask_tile == lbl) &
-                                                 (img_tile_smoothed < np.max(
-                                                     ((0.2 * spot_max[p_idx]), (3 * background)))),
-                                                 0,
-                                                 mask_tile)
+                    # recenter spot positions, create spot position array for all spots, overwrite array
+                    spot_pos_array = np.zeros_like(img_tile_padded, dtype=np.uint16)
+                    for lbl, z, y, x in spot_props[['label', 'centroid_z', 'centroid_y', 'centroid_x']].to_numpy():
+                        pos_ = [round(value) for value in [z, y, x]]
+                        spot_pos_array[tuple(pos_)] = lbl
 
-                        """
-                        # close holes
-                        for p_idx, lbl in enumerate(spot_props['label']):
-                            mask_tile_ = remove_small_holes(np.where(mask_tile==lbl, 1, 0), area_threshold=27, connectivity=1, out=None)
-                            mask_tile = np.where(mask_tile_, lbl, mask_tile)
-                        """
+                    # extend spot positions using expected spot radius at updated positions
+                    spot_pos_mask = expand_labels(spot_pos_array, distance=spot_expand_distance)
 
-                        # write mask tile to file
-                        self._write_mask_tile(
-                            mask_tile=mask_tile,
-                            path=Path(self.sd_masks),
-                            file=file,
-                        )
+                    if self.spot_extraction_procedure == 1:
+                        # procedure 1: expand spot positions considering relative intensity following simple Gaussian filter
+                        spot_pos_mask_new = np.zeros_like(spot_pos_mask, dtype=np.uint16)
+                        spot_props.sort_values(by=['intensity_max', 'area', ], ascending=[False, False, ], inplace=True)
+                        for lbl, int_max in spot_props[['label', 'intensity_max']].to_numpy():
+                            lbl = int(lbl)
+                            _mask = np.where(spot_pos_mask == lbl, 1, 0)
+                            _mask = np.where(img_tile_padded_smoothed >= (self.spot_intensity_threshold * int_max), _mask, 0)
+                            _mask = ndi.binary_closing(_mask, structure=ndi.generate_binary_structure(3, 3).astype(np.uint8), iterations=1, output=None, origin=0, mask=None, border_value=0, brute_force=False)
+                            spot_pos_mask_new = np.where(_mask == 1, lbl, spot_pos_mask_new)
+                        spot_pos_mask = spot_pos_mask_new
 
-        return
+                    if self.spot_extraction_procedure == 2:
+                        # procedure 2: use watershed to describe spots
+                        img_tile_padded_dog = difference_of_gaussians(img_tile_padded_smoothed, 0.0, high_sigma=1.0, mode='constant', cval=0, channel_axis=None, truncate=4.0)
+                        spot_pos_mask = watershed(-img_tile_padded_dog, markers=spot_pos_array, connectivity=1, offset=None, mask=spot_pos_mask, compactness=1.0, watershed_line=True)
+
+                    # remove padded parts
+                    mask_tile = spot_pos_mask[(slice(0, self.tile_shape[0]), slice(t_pad, (self.tile_shape[1] + t_pad)), slice(t_pad, (self.tile_shape[2] + t_pad)))]
+                    
+                    # write mask tile to file
+                    self._write_mask_tile(
+                        mask_tile=mask_tile,
+                        path=Path(self.sd_masks),
+                        file=file,
+                    )
 
     @staticmethod
     def _write_img_tile(img_tile, path, file):
@@ -836,28 +870,24 @@ class DataHandler:
             imagej=False,
             bigtiff=False,
             photometric="minisblack",
-            # compression="zlib",
-            # compressionargs={"level": 8},
             resolution=(1.0, 1.0),
             metadata={"axes": "ZYXC", "spacing": 1.0, "unit": "pixel"},
         )
 
         # save for imagej (optional)
-        """
-        # swap axes to reach TZCYX format
-        img_tile = np.swapaxes(img_tile, 3, 1)
-        img_tile = np.swapaxes(img_tile, 2, 3)
-        imwrite(
-            path / (f"x_{file}" + ".tif"),
-            img_tile.astype(np.float32),
-            imagej=True,
-            bigtiff=False,
-            photometric="minisblack",
-            # compression=("zlib", 8),
-            resolution=(1.0, 1.0),
-            metadata={"axes": "ZCYX", "spacing": 1.0, "unit": "pixel"},
-        )
-        """
+        save4ij = True
+        if save4ij:
+            # swap axes to reach TZCYX format
+            img_tile = np.transpose(img_tile, (0, 3, 2, 1))
+            imwrite(
+                path / (f"x_{file}" + ".tif"),
+                img_tile.astype(np.float32),
+                imagej=True,
+                bigtiff=False,
+                photometric="minisblack",
+                resolution=(1.0, 1.0),
+                metadata={"axes": "ZCYX", "spacing": 1.0, "unit": "pixel"},
+            )
 
     @staticmethod
     def _write_mask_tile(mask_tile, path, file):
@@ -870,8 +900,6 @@ class DataHandler:
             imagej=False,
             bigtiff=False,
             photometric="minisblack",
-            # compression="zlib",
-            # compressionargs={"level": 1},
             resolution=(1.0, 1.0),
             metadata={"axes": "ZYX", "spacing": 1.0, "unit": "pixel"},
         )
