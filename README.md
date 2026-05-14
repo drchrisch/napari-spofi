@@ -32,7 +32,6 @@ The objects of interest in the image are sphere-like spots with a diameter of ju
 few pixels and are thus well suited for StarDist instance segmentation. The image 
 dimensions are typically 1024x1024 pixels in xy and ≥ 64 sections in z.
 
-
 ## Installation
 
 With python and pip installed (e.g., via miniconda or miniforge),
@@ -45,22 +44,25 @@ it is recommended to create a new environment and install `napari-spofi` using p
 Start `napari` and select "spot finder (napari-spofi)" from the "plugin" menu.
 
 ### Annotate image
+One should start the model generation with processed images (background removed, denoised, ...).
 Go to the 'annotation' section of the widget and create a new directory for annotations. Add an image
-folder containing at least one h5 file (foreground and background, e.g., 'ch1' & 'ch2'). Select an image file, foreground and background
-channels. Load the image file.
+folder containing at least one h5 file containing dataframes with foreground and background signals (e.g., 'ch1_processed' & 'ch2_processed') (default names can be changed in resources/spofi_defaults.json).
+Select an image file, chose foreground and background channels. Load the image file.
 
 Inspect the image for distinct regions. To help locate relevant tile positions, make
 the 'checkerboard' layer visible. While the 'tiles' layer is active, double-click a tile
-to add it to the list of tiles. This list will be used to generate a set of 
+to add it to the list of tiles to process. This list will be used to generate a set of 
 images and masks for training purposes.
 
 Switch to napari's 2D view. Navigate to the centre section of each spot in the active tile
-and annotate by adding points (one point per spot) using the 'true' points layer. The
-built-in heuristic will automatically annotate pixels that belong to individual spots.
-Some image enhancement step before loading images may be beneficial. 
+and annotate by adding points (one point per spot) using the 'true' points layer. 
+Annotate tiles in one or multiple images.
+Click the 'extract spots' button to prepare training data. First, the algorithm tries to find the maximum intensity position in the manually assigned spot region.
+Then a spot mask is generated using one of the two available procedures. Either, pixels with relative minimal intensities as given by the intensity threshold are used to
+define the spot area. Alternatively a watershed segmentation on the difference of Gaussians filtered foreground image is used.
+In both cases, the procedures focus in on a sub-region around annotated spot positions.
 
-Annotate tiles in one or a multiple images.
-To prepare training data, use the 'extract spots' button.
+There is a "suggest spots" option that uses a Laplacian of Gaussian method to locate spots. This may be used as a first step to aid manual annotation.
 
 ### Train a StarDist model
 Go to the 'training' section of the widget. Adjust the "number of epochs". For a first
@@ -80,14 +82,11 @@ adjusted. Start a new prediction and load the predicted spots when the process h
 finished. (It is possible to load an existing prediction).
 
 ### Polish annotation
-Predicted spots will be loaded into two new layers: 'predicted' and 'edited'. The
+Predicted spots will be loaded into a new layer 'predicted'. The
 'predicted' layer is not editable and gives an overview of the spots found. Check
-your annotation in the active tiles ('true' layer) and compare it carefully with
-the spots in the 'edited' layer.
-Adjust the positions of the spots or remove any incorrect spots from the 'edited'
+your annotation in the active tiles ('true' layer).
+Adjust the positions of the spots or remove any incorrect spots from the 'true'
 layer. Extract the spots and train a new model or retrain the model.
-
-
 
 ## Contributing
 
@@ -100,7 +99,7 @@ Distributed under the terms of the [BSD-3] license,
 
 ## Issues
 
-If you encounter any problems, please [file an issue] along with a detailed description.
+If you encounter any problems, please file an issue along with a detailed description.
 
 [napari]: https://github.com/napari/napari
 [Cookiecutter]: https://github.com/audreyr/cookiecutter
