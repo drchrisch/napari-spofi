@@ -1,4 +1,4 @@
-__version__ = "0.0.2"
+__version__ = "0.0.3a"
 try:
     from ._version import version as __version__
 except ImportError:
